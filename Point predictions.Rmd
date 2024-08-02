@@ -1,0 +1,283 @@
+---
+title: "Point predictions CRW"
+author: "Fletcher Robbins"
+date: "2023-11-14"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(landscapemetrics)
+library(tidyverse)
+library(sf)
+library(raster)
+library(terra)
+library(gtools) 
+library(conflicted)
+library(spgwr)
+library(spmodel)
+library(sp)
+library(gstat)
+library(spatstat)
+library(rje)
+library(class)
+library(geodata)
+```
+
+```{R}
+crw <- read_csv("crw.csv") %>%
+  mutate_if(is.character, as.factor)
+crd <- read_csv("districts.csv")
+
+wi_shp <-
+  read_sf("shp/WI_County_Bnds.shp") %>%
+  st_transform(crs = 4032) %>%
+  rename(County = COUNTY_NAM) %>%
+  select(County, geometry)
+
+crw_by_site <- crw %>%
+  group_by(District, County, Year, Lon, Lat) %>%
+  summarise(meanTotCRW = mean(TotCRW),
+            meanNCRW = mean(NorthernCRW),
+            meanWCRW = mean(WesternCRW)) %>%
+  st_as_sf(coords = c("Lon", "Lat"), crs = 4032)  %>%
+  mutate(ID = 1:n())
+  #mutate(id = seq_len(n()))
+  #mutate(id = row_number())
+
+```{R}
+crw_by_site_long <- 
+  crw %>%
+  group_by(District, County, Year, Lon, Lat) %>%
+  summarise(TotalCRW = mean(TotCRW),
+            NorthernCRW = mean(NorthernCRW),
+            WesternCRW = mean(WesternCRW)) %>%
+  ungroup() %>%
+  mutate(ID = 1:n()) %>%
+  pivot_longer(cols = c(TotalCRW, NorthernCRW, WesternCRW)) %>%
+  st_as_sf(coords = c("Lon", "Lat"), crs = 4032)%>%
+  group_by(District, County, Lon, Lat) %>%
+  summarise(meanTotCRW = mean(TotCRW),
+            meanNCRW = mean(NorthernCRW),
+            meanWCRW = mean(WesternCRW)) %>%
+  st_as_sf(coords = c("Lon", "Lat"), crs = 4032)  %>%
+  mutate(ID = 1:n()) 
+```
+
+```{R}
+crw_by_site_old <-
+  crw %>%
+  filter(Year <= 2017) %>%
+  group_by(District, County, Lon, Lat) %>%
+  summarise(meanTotCRW = mean(TotCRW),
+            meanNCRW = mean(NorthernCRW),
+            meanWCRW = mean(WesternCRW)) %>%
+  st_as_sf(coords = c("Lon", "Lat"), crs = 4032)%>%
+  mutate(ID = 1:n())
+
+corn_rast <- rast("Crop_Frequency_2008-2022\\crop_frequency_corn_2008-2022.tif")
+
+crw_by_site_old
+crw_by_site_new
+```
+```{R}
+g = st_make_grid(wi_shp, cellsize= .075, what='centers')
+
+df1 = data.frame(st_coordinates(g[]))
+
+#crw_df<- data.frame(st_coordinates(df1[]))
+
+#write_csv(crw_df, "crw_df.csv")
+#write_csv(df1, "WI_grid.csv")
+```
+
+```{R}
+WI_grid<- st_make_grid(
+  wi_shp,
+  #cellsize = .01,
+  #offset = st_bbox(x)[c("xmin", "ymin")],
+  n = c(25887, 26962 ),
+  #crs = if (missing(x)) NA_crs_ else st_crs(x),
+  what = "centers"
+  #square = TRUE,
+  #flat_topped = FALSE
+ #, "WI_grid.csv"
+)
+
+```
+```{r}
+df2 = data.frame(st_coordinates(WI_grid[]))
+WI_grid
+```
+
+
+```{r}
+# lsm function wrapper
+lsm_fn <- function(df, rast, dist) {
+  # df needs 'ID' column
+  # dist in meters, can take multiple values
+  require(landscapemetrics)
+  require(raster)
+  require(dplyr)
+  #message("Using landscape: ", rast@file@name)
+  for (i in 1:length(dist)) {
+    #message("Buffer ", i, " of ", length(dist), ": ", dist[i], "m")
+    lsm <-
+      sample_lsm(
+        landscape = rast,
+        y = df,
+        #plot_id = df$ID,
+        shape = "circle",
+        size = dist[i],
+        what = "lsm_c_pland",
+        progress = TRUE
+      ) %>%
+      filter(class != 255) %>%
+      mutate(area = value * (percentage_inside / 100)) %>%
+      mutate(intensity = class * area / 100) %>%
+      replace(is.na(.), 0) %>%
+      group_by(plot_id) %>%
+      summarise(!!paste0("intensity_", dist[i]) := sum(intensity))
+    if (i == 1) {lsm_merge <- lsm} else {lsm_merge <- full_join(lsm_merge, lsm)}
+  }
+  inner_join(lsm_merge, df, by = c("plot_id" = "ID")) %>%
+    rename(ID = plot_id) %>%
+    st_as_sf(crs = crs(df))
+}
+```
+
+```{R}
+crw_train <-
+  crw_by_site_old %>%
+  st_transform(crs(corn_rast))
+
+crw_test <-
+  crw_by_site_new %>%
+  st_transform(crs(corn_rast))
+
+
+crw_by_site <- 
+  crw_by_site %>%
+  st_transform(crs(corn_rast))
+
+crw_lsm1 <- crw_train %>% lsm_fn(corn_rast, c(5000))
+crw_train_df <- crw_lsm1 %>%
+  st_transform(crs = 4032) %>%
+  mutate(lon = st_coordinates(.)[, "X"],
+         lat = st_coordinates(.)[, "Y"]) %>%
+  st_set_geometry(NULL)
+
+
+crw_lsm2 <- crw_test %>% lsm_fn(corn_rast, c(5000))
+crw_test_df <- crw_lsm2 %>%
+  st_transform(crs = 4032) %>%
+  mutate(lon = st_coordinates(.)[, "X"],
+         lat = st_coordinates(.)[, "Y"]) %>%
+  st_set_geometry(NULL)
+
+crw_lsm3 <- crw_by_site %>% lsm_fn(corn_rast, c(5000))
+crw_df <- crw_lsm3 %>%
+  st_transform(crs = 4032) %>%
+  mutate(lon = st_coordinates(.)[, "X"],
+         lat = st_coordinates(.)[, "Y"]) %>%
+  st_set_geometry(NULL)
+```
+
+```{R}
+crw_train_df
+crw_test_df 
+crw_df
+
+crw_train_df1 <- crw_train_df
+crw_test_df1 <- crw_test_df
+crw_df1 <- crw_df
+
+model1 <- lm(lon~ intensity_5000+ meanTotCRW, data=crw_train_df)
+model2 <- lm(lat~ intensity_5000+ meanTotCRW, data=crw_train_df)
+
+lat_pred<- predict(model1, newdata = crw_test_df)
+lon_pred<- predict(model2, newdata = crw_test_df)
+
+df<- data.frame(lon= predict(model1, newdata = crw_test_df), lat= predict(model2, newdata = crw_test_df))
+qplot(lon,lat,data=df)  +geom_point(data=crw_test_df,colour='red') 
+
+#coordinates(crw_df) = ~lon+lat
+
+spbb <- st_as_sf(crw_df, crs = 4032)          
+dist_matrix   <- st_distance(spbb, spbb)
+diag(dist_matrix) <- NA
+spbb$avg  <- rowMeans(dist_matrix)
+
+
+```
+
+```{R}
+#coordinates(crw_train_df) = ~lon+lat
+#coordinates(crw_test_df) = ~lon+lat
+
+#crw_train_df <- st_as_sf(crw_train_df, crs = 4032)          
+km<- kmeans(crw_df1[7:8], 400, 5)
+crw_df1$cluster <- km$cluster
+
+df<- crw_df1 %>%
+  group_by(cluster) %>%
+  summarise_at(vars(meanTotCRW), list(name=sd))
+ggplot(df, aes(x=name)) + geom_histogram()
+```
+
+```{R}
+crw_df1 <- st_as_sf(crw_df1, crs = 4032)
+
+crw.vgm<- variogram(log(meanTotCRW)~1, crw_df1, cutoff= 150)
+#crw.vgm<- variogram(intensity_5000~1, crw_df1)
+crw.fit <- fit.variogram(crw.vgm, model=vgm("Sph"))
+plot(crw.vgm,crw.fit)
+
+g = st_make_grid(crw_df1, cellsize= .075, what='centers')
+
+plot(g)
+plot(st_geometry(crw_df1) , add = TRUE)
+df1 = data.frame(st_coordinates(g[]))
+
+#crw.kriged <- krige(meanTotCRW~1, crw_df1, g, model=crw.fit)
+
+#crw.kriged <- krige(meanTotCRW~1, crw_df1, g, model=crw.fit)
+crw.kriged %>% as.data.frame %>%
+  ggplot(aes(x=x, y=y)) + geom_tile(aes(fill=var1.pred)) + coord_equal() +
+  scale_fill_gradient(low = "yellow", high="red") +
+  #scale_x_continuous(labels=comma) + scale_y_continuous(labels=comma) +
+  theme_bw()
+```
+```{r}
+Lawton <-  read_csv('C:\\Users\\frobb\\Documents\\Data\\Evolutionary Rates\\Lawton_etal_data.csv') %>%
+  mutate_if(is.character, as.factor)
+Lawton
+```
+```{R}
+wi_shp <-
+  read_sf("shp/WI_County_Bnds.shp") %>%
+  st_transform(crs = 4032) %>%
+  rename(County = COUNTY_NAM) %>%
+  select(County, geometry)
+
+crw_by_site <- Lawton %>%
+  group_by(District, County, Year, Lon, Lat) %>%
+  summarise(meanTotCRW = mean(TotCRW),
+            meanNCRW = mean(NorthernCRW),
+            meanWCRW = mean(WesternCRW)) %>%
+  st_as_sf(coords = c("Lon", "Lat"), crs = 4032)  %>%
+  mutate(ID = 1:n())
+  #mutate(id = seq_len(n()))
+  #mutate(id = row_number())
+
+
+corn_rast <- rast("Crop_Frequency_2008-2022\\crop_frequency_corn_2008-2022.tif")
+```
+
+
+
+```{R}
+#cropland(source= 'WorldCover' , path= "C:\\Users\\frobb\\Downloads", year=2003)
+footprint(year= 2009, path="C:\\Users\\frobb\\Downloads")
+```
+
